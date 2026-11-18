@@ -58,7 +58,7 @@ export function drawHUD(ctx, canvasW, canvasH) {
   drawStars(ctx, canvasW - 188, 44, G.wanted);
   outlinedText(ctx, districtAt(p.x, p.y), canvasW - 188, 78, '#ffffff', FONT_MED);
   if (G.wanted > 0 && G.bustTimer > 0) {
-    outlinedText(ctx, 'BUSTED SOON… RUN!', canvasW - 188, 108, '#ff5555', FONT_MED);
+    outlinedText(ctx, 'BUSTED SOON… RUN!', canvasW - 12, 124, '#ff5555', FONT_MED, 'right');
   }
 
   // Objective banner, top centre.

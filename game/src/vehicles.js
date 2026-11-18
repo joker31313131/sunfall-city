@@ -88,6 +88,7 @@ export function enterCar(car) {
   car.isParked = false;
   car.driver = false;
   car.isTraffic = false;
+  car.isPolice = false; // a stolen cruiser stops being a pursuer
   car.speed = 0;
   p.x = car.x; p.y = car.y;
   G.stats.carsStolen++;

@@ -32,7 +32,9 @@ function addChasers(count) {
   const p = G.player;
   for (let i = 0; i < count; i++) {
     const a = (i / count) * Math.PI * 2 + 0.6;
-    const car = makeCar(p.x + Math.cos(a) * 300, p.y + Math.sin(a) * 300, 'cruiser', '#2c3e50', { angle: Math.atan2(p.y - (p.y + Math.sin(a) * 300), p.x - (p.x + Math.cos(a) * 300)) });
+    const dist = 400 + i * 60;
+    const cx = p.x + Math.cos(a) * dist, cy = p.y + Math.sin(a) * dist;
+    const car = makeCar(cx, cy, 'cruiser', '#2c3e50', { angle: Math.atan2(p.y - cy, p.x - cx) });
     car.isPolice = true;
     car.speed = 200;
     G.cars.push(car);
@@ -67,6 +69,9 @@ export function stageShot(scene, seed) {
     scarePeds(p.x, p.y, 400);
   } else if (scene === 'foot') {
     // On-foot city action: Mara aiming, rivals ahead, traffic and peds.
+    // Barrels near the fight are cleared so a stray bullet cannot chain
+    // the whole scene away before the capture lands.
+    G.barrels = G.barrels.filter((b) => Math.hypot(b.x - a.yard.x, b.y - a.yard.y) > 320);
     p.x = a.yard.x - 160; p.y = a.yard.y;
     p.aimAngle = 0;
     giveWeapon('smg');
@@ -79,23 +84,23 @@ export function stageShot(scene, seed) {
     G.camera.x = p.x - 640;
     G.camera.y = p.y - 360;
   } else if (scene === 'chase') {
-    // Police chase with combat: wanted 4, cruisers + officers, Mara shooting.
-    p.x = a.downtownX || 1700; p.y = 1700;
-    p.aimAngle = -0.6;
+    // Police chase with combat: Mara holds the Downtown intersection,
+    // wanted 4, cruisers + officers closing in, rivals on the east road.
+    p.x = 1800; p.y = 1800;
+    G.barrels = G.barrels.filter((b) => Math.hypot(b.x - p.x, b.y - p.y) > 320);
+    p.aimAngle = 0;
     giveWeapon('shotgun');
     p.money = 1250;
     G.wanted = 4;
     addChasers(3);
-    for (let i = 0; i < 2; i++) {
-      G.cops.push({
-        x: p.x + 180 + i * 60, y: p.y - 120 + i * 80,
-        angle: 0, health: 60, speed: 150, fireCooldown: 1, walkPhase: 0,
-      });
-    }
-    addRivalCrew(p.x + 220, p.y - 60, 2);
+    G.cops.push(
+      { x: p.x - 190, y: p.y + 30, angle: 0, health: 60, speed: 150, fireCooldown: 1, walkPhase: 0 },
+      { x: p.x + 40, y: p.y + 200, angle: 0, health: 60, speed: 150, fireCooldown: 1, walkPhase: 0 },
+    );
+    addRivalCrew(p.x + 240, p.y, 2);
     G.missionIndex = 4;
     G.mission = { index: 4, stage: 0, timer: 0, spawned: G.enemies.slice(), car: null };
-    setObjective('Defeat the rival crew (2 left)', { x: p.x + 220, y: p.y - 60, label: 'FINALE' });
+    setObjective('Defeat the rival crew (2 left)', { x: p.x + 240, y: p.y, label: 'FINALE' });
     showBriefing('Sunset Showdown', 'The rival crew is waiting in the Downtown yard. Finish it.');
     G.camera.x = p.x - 640;
     G.camera.y = p.y - 360;

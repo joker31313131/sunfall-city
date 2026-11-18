@@ -3,7 +3,7 @@
 // player, and heat that cools when the player breaks line of sight.
 import { WANTED_MAX, BUST_RADIUS, BUST_TIME, HEAT_DECAY_TIME, WORLD_SIZE } from './config.js';
 import { G } from './state.js';
-import { lineOfSight, collideCircle } from './world.js';
+import { lineOfSight, collideCircle, pointBlocked } from './world.js';
 import { makeCar, damageCar } from './vehicles.js';
 import { addFloater, addShake } from './effects.js';
 import { sfxSirenBlip, sfxBusted, setSiren } from './audio.js';
@@ -70,7 +70,30 @@ function desiredOfficers() {
 function updateCruiser(car, dt) {
   const p = G.player;
   const def = car.def;
-  const targetAngle = Math.atan2(p.y - car.y, p.x - car.x);
+  if (car.ramCooldown > 0) car.ramCooldown -= dt;
+  let targetAngle = Math.atan2(p.y - car.y, p.x - car.x);
+  // Building avoidance: probe ahead and steer around what blocks the way,
+  // so cruisers chase through streets instead of piling onto rooftops.
+  const probeX = car.x + Math.cos(car.angle) * 85;
+  const probeY = car.y + Math.sin(car.angle) * 85;
+  if (pointBlocked(probeX, probeY, G.world)) {
+    const leftA = car.angle - 0.9, rightA = car.angle + 0.9;
+    const leftBlocked = pointBlocked(car.x + Math.cos(leftA) * 85, car.y + Math.sin(leftA) * 85, G.world);
+    const rightBlocked = pointBlocked(car.x + Math.cos(rightA) * 85, car.y + Math.sin(rightA) * 85, G.world);
+    if (!leftBlocked) targetAngle = leftA;
+    else if (!rightBlocked) targetAngle = rightA;
+    else targetAngle = car.angle + Math.PI;
+  }
+  // Separation: cruisers should fan out, not stack on one spot.
+  for (const other of G.cars) {
+    if (other === car || !other.isPolice || other.dead) continue;
+    const dx = car.x - other.x, dy = car.y - other.y;
+    const d = Math.hypot(dx, dy);
+    if (d > 0 && d < 80) {
+      car.x += (dx / d) * 60 * dt;
+      car.y += (dy / d) * 60 * dt;
+    }
+  }
   let diff = targetAngle - car.angle;
   while (diff > Math.PI) diff -= Math.PI * 2;
   while (diff < -Math.PI) diff += Math.PI * 2;
@@ -79,14 +102,20 @@ function updateCruiser(car, dt) {
   car.angle += Math.max(-def.turn * dt, Math.min(def.turn * dt, diff));
   car.x += Math.cos(car.angle) * car.speed * dt;
   car.y += Math.sin(car.angle) * car.speed * dt;
+  // Never end a frame inside a building: push out softly so a hard turn
+  // cannot leave a cruiser parked on a rooftop.
+  const fixed = collideCircle(car.x, car.y, 20, G.world);
+  car.x = fixed.x; car.y = fixed.y;
   car.x = Math.max(24, Math.min(WORLD_SIZE - 24, car.x));
   car.y = Math.max(24, Math.min(WORLD_SIZE - 24, car.y));
-  // Ramming the player's car hurts both.
-  if (p.inCar && Math.hypot(car.x - p.x, car.y - p.y) < 52 && car.speed > 100) {
+  // Ramming the player's car hurts both — with a cooldown so one touch
+  // does not shred the whole car in a single second.
+  if (p.inCar && car.ramCooldown <= 0 && Math.hypot(car.x - p.x, car.y - p.y) < 52 && car.speed > 100) {
     damageCar(p.inCar, 8);
     damageCar(car, 5);
     addShake(4);
     car.speed *= 0.5;
+    car.ramCooldown = 0.8;
   }
   // A cruiser far away despawns so the chase stays tight.
   if (Math.hypot(car.x - p.x, car.y - p.y) > 1600) {
@@ -126,8 +155,9 @@ export function updatePolice(dt) {
     G.bustTimer = 0;
     return;
   }
-  // Keep the pursuit at the right strength.
-  const cruisers = G.cars.filter((c) => c.isPolice && !c.dead);
+  // Keep the pursuit at the right strength. The player's own ride never
+  // counts as a pursuer, even if it used to be a cruiser.
+  const cruisers = G.cars.filter((c) => c.isPolice && !c.dead && c !== G.player.inCar);
   if (cruisers.length < desiredCruisers() && Math.random() < 0.02) spawnCopCar();
   const alive = G.cops.filter((c) => c.health > 0);
   if (alive.length < desiredOfficers() && Math.random() < 0.02) spawnOfficer();
