@@ -71,7 +71,17 @@ function updateCruiser(car, dt) {
   const p = G.player;
   const def = car.def;
   if (car.ramCooldown > 0) car.ramCooldown -= dt;
-  let targetAngle = Math.atan2(p.y - car.y, p.x - car.x);
+  // Close in on the player, but flank to the side when near instead of
+  // stacking exactly on top of the player's car and hiding it.
+  const distToPlayer = Math.hypot(p.x - car.x, p.y - car.y);
+  let tx = p.x, ty = p.y;
+  if (distToPlayer < 170) {
+    const side = car.id % 2 === 0 ? 1 : -1;
+    const perp = p.angle + Math.PI / 2;
+    tx = p.x + Math.cos(perp) * 58 * side;
+    ty = p.y + Math.sin(perp) * 58 * side;
+  }
+  let targetAngle = Math.atan2(ty - car.y, tx - car.x);
   // Building avoidance: probe ahead and steer around what blocks the way,
   // so cruisers chase through streets instead of piling onto rooftops.
   const probeX = car.x + Math.cos(car.angle) * 85;
