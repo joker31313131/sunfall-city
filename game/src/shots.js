@@ -1,79 +1,107 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// Screenshot staging: ?shot=<scene>&seed=<n> URL parameters deterministically
+// arrange a scene for captures. Staging runs once at boot, only when the
+// parameter is present, and never touches normal play state otherwise.
+import { G, freshPlayer } from './state.js';
+import { generateWorld } from './world.js';
+import { spawnCityCars, makeCar, enterCar } from './vehicles.js';
+import { spawnPeds, scarePeds } from './pedestrians.js';
+import { spawnEnemy } from './combat.js';
+import { makeRng } from './random.js';
+import { setObjective, showBriefing, MISSIONS } from './missions.js';
+import { giveWeapon } from './player.js';
+import { addWanted } from './police.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
-
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+export function shotParams() {
+  const q = new URLSearchParams(location.search);
+  return { shot: q.get('shot'), seed: parseInt(q.get('seed') || '1', 10) || 1 };
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+function baseScene(seed) {
+  const rng = makeRng(seed);
+  G.world = generateWorld(seed);
+  G.barrels = G.world.barrels.map((b) => ({ ...b }));
+  G.player = freshPlayer(G.world.anchors.start.x, G.world.anchors.start.y);
+  spawnCityCars(rng);
+  spawnPeds(rng, 34);
+  G.camera.x = G.player.x - 640;
+  G.camera.y = G.player.y - 360;
+  G.screen = 'play';
 }
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+function addChasers(count) {
+  const p = G.player;
+  for (let i = 0; i < count; i++) {
+    const a = (i / count) * Math.PI * 2 + 0.6;
+    const car = makeCar(p.x + Math.cos(a) * 300, p.y + Math.sin(a) * 300, 'cruiser', '#2c3e50', { angle: Math.atan2(p.y - (p.y + Math.sin(a) * 300), p.x - (p.x + Math.cos(a) * 300)) });
+    car.isPolice = true;
+    car.speed = 200;
+    G.cars.push(car);
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+}
+
+function addRivalCrew(x, y, count) {
+  for (let i = 0; i < count; i++) {
+    spawnEnemy(x + (Math.random() - 0.5) * 200, y + (Math.random() - 0.5) * 200, { mission: true });
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+}
+
+// Stages one named scene. Returns true when a scene was staged.
+export function stageShot(scene, seed) {
+  if (!scene || scene === 'start') return false;
+  baseScene(seed);
+  const a = G.world.anchors;
+  const p = G.player;
+  if (scene === 'drive') {
+    // Car chase: Mara in a coupe, 3 stars, cruisers closing, job live.
+    const car = makeCar(a.start.x + 40, a.start.y, 'coupe', '#e84a4a', { angle: 0 });
+    G.cars.push(car);
+    enterCar(car);
+    car.speed = 240;
+    G.wanted = 3;
+    addChasers(3);
+    G.missionIndex = 1;
+    G.mission = { index: 1, stage: 0, timer: 52, spawned: [], car: null };
+    setObjective('Reach the warehouse — 52s left', { x: a.warehouse.x, y: a.warehouse.y, label: 'WAREHOUSE' });
+    showBriefing('Heat Run', 'The package was hotter than Rook said. Cops are on you — get to the warehouse before the clock runs out.');
+    p.money = 540;
+    scarePeds(p.x, p.y, 400);
+  } else if (scene === 'foot') {
+    // On-foot city action: Mara aiming, rivals ahead, traffic and peds.
+    p.x = a.yard.x - 160; p.y = a.yard.y;
+    p.aimAngle = 0;
+    giveWeapon('smg');
+    p.money = 890;
+    addRivalCrew(a.yard.x + 120, a.yard.y, 4);
+    G.missionIndex = 2;
+    G.mission = { index: 2, stage: 0, timer: 0, spawned: G.enemies.slice(), car: null };
+    setObjective('Clear out the warehouse crew (4 left)', { x: a.yard.x, y: a.yard.y, label: 'FIGHT' });
+    showBriefing('Clear the Warehouse', 'Rook\u2019s rivals moved in. Take them all down.');
+    G.camera.x = p.x - 640;
+    G.camera.y = p.y - 360;
+  } else if (scene === 'chase') {
+    // Police chase with combat: wanted 4, cruisers + officers, Mara shooting.
+    p.x = a.downtownX || 1700; p.y = 1700;
+    p.aimAngle = -0.6;
+    giveWeapon('shotgun');
+    p.money = 1250;
+    G.wanted = 4;
+    addChasers(3);
+    for (let i = 0; i < 2; i++) {
+      G.cops.push({
+        x: p.x + 180 + i * 60, y: p.y - 120 + i * 80,
+        angle: 0, health: 60, speed: 150, fireCooldown: 1, walkPhase: 0,
+      });
+    }
+    addRivalCrew(p.x + 220, p.y - 60, 2);
+    G.missionIndex = 4;
+    G.mission = { index: 4, stage: 0, timer: 0, spawned: G.enemies.slice(), car: null };
+    setObjective('Defeat the rival crew (2 left)', { x: p.x + 220, y: p.y - 60, label: 'FINALE' });
+    showBriefing('Sunset Showdown', 'The rival crew is waiting in the Downtown yard. Finish it.');
+    G.camera.x = p.x - 640;
+    G.camera.y = p.y - 360;
+  } else {
+    return false;
+  }
+  G.shotMode = scene;
+  return true;
 }

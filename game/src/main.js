@@ -1,134 +1,247 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s steps
-// (several in a slow frame, none in a fast one), and the renderer paints what is there. The game
-// moves between four screens: title, play, paused and game over.
-//
-// ?seed=N fixes the falling pattern. ?shot=start|play|end (with &seed=N) stages that scene
-// instead of running the loop, paints it twice and sets window.__shotReady for a screenshot.
-import { BEST_KEY, LIVES, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { createWorld, EVENT_HIT, EVENT_OVER } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createRenderer, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-import { stageShot } from './shots.js';
-
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
-const MAX_FRAME = 0.25;
-
-const params = new URLSearchParams(window.location.search);
-const shot = params.get('shot');
-const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
-const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+// Sunfall City — boot, main loop and the single interaction dispatcher.
+// This file owns the screen state machine and wires every system together;
+// each system lives in its own module.
+import { G, freshPlayer, resetRunState } from './state.js';
+import { generateWorld } from './world.js';
+import { makeRng } from './random.js';
+import { bindInput, keys, pressed, mouse, endFrameInput } from './input.js';
+import { spawnCityCars, updateVehicles, nearestCar, enterCar, exitCar } from './vehicles.js';
+import { spawnPeds, updatePeds } from './pedestrians.js';
+import { updatePolice, clearWanted } from './police.js';
+import { updateBullets, updateEnemies, playerShoot, aimAngleFromMouse } from './combat.js';
+import { updatePlayerOnFoot, switchWeapon, startReload } from './player.js';
+import { updateMissions, missionInteract, setObjective, showBriefing, MISSIONS } from './missions.js';
+import { shopInteract } from './shops.js';
+import { updateEffects } from './effects.js';
+import { drawWorld, updateCamera } from './render.js';
+import { drawHUD } from './hud.js';
+import { drawTitle, drawPause, drawHelp, drawWasted, drawBusted, clickMenu, drawStoryCompleteBanner } from './ui.js';
+import { hasSave, saveGame, loadSaveData, applySave, clearSave } from './save.js';
+import { initAudio, setMuted, isMuted, startEngine, setEngine, startSiren, startMusic, sfxClick, sfxHorn } from './audio.js';
+import { shotParams, stageShot } from './shots.js';
 
 const canvas = document.getElementById('game');
-const status = document.getElementById('status');
-const world = createWorld(createRandom(seed));
-const renderer = createRenderer(canvas);
+const ctx = canvas.getContext('2d');
 
-function readBest() {
-  try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
-  } catch {
-    return 0;
+function resize() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+window.addEventListener('resize', resize);
+resize();
+bindInput(canvas);
+
+let saveAvailable = hasSave();
+
+function newWorld(seed) {
+  resetRunState(seed);
+  G.world = generateWorld(seed);
+  G.barrels = G.world.barrels.map((b) => ({ ...b }));
+  const rng = makeRng(seed);
+  spawnCityCars(rng);
+  spawnPeds(rng, 34);
+}
+
+function startNewGame() {
+  const seed = (Date.now() % 100000) + 1;
+  newWorld(seed);
+  const a = G.world.anchors;
+  G.player = freshPlayer(a.start.x, a.start.y);
+  G.camera.x = G.player.x - canvas.width / 2;
+  G.camera.y = G.player.y - canvas.height / 2;
+  G.screen = 'play';
+  setObjective(`Next job: ${MISSIONS[0].title} — go to the gold marker`, { x: a.lookout.x, y: a.lookout.y, label: 'JOB' });
+  showBriefing('Welcome to Sunfall City', 'Mara Voss is new in town and Rook has work. Follow the gold marker to the lookout and press E to start the first job.');
+  beginAudio();
+  saveGame();
+}
+
+function continueGame() {
+  const data = loadSaveData();
+  if (!data) { startNewGame(); return; }
+  newWorld(data.seed || 1);
+  applySave(data);
+  setMuted(G.muted);
+  G.camera.x = G.player.x - canvas.width / 2;
+  G.camera.y = G.player.y - canvas.height / 2;
+  G.screen = 'play';
+  const a = G.world.anchors;
+  if (G.missionIndex < MISSIONS.length) {
+    const spots = [a.lookout, a.garage, a.warehouse, a.garage, a.yard];
+    const m = spots[G.missionIndex];
+    setObjective(`Next job: ${MISSIONS[G.missionIndex].title} — go to the gold marker`, { x: m.x, y: m.y, label: 'JOB' });
+  } else {
+    setObjective('All jobs done — Sunfall City is yours. Free roam!', null);
+  }
+  showBriefing('Welcome back', 'Your save is loaded. The city kept your parking spot warm.');
+  beginAudio();
+}
+
+function beginAudio() {
+  initAudio();
+  startEngine();
+  startSiren();
+  startMusic();
+}
+
+function respawn() {
+  const p = G.player;
+  const hospital = G.world.shops.find((s) => s.kind === 'hospital');
+  p.x = hospital.x; p.y = hospital.y + 60;
+  p.inCar = null;
+  p.health = p.maxHealth;
+  p.invuln = 1;
+  clearWanted();
+  G.screen = 'play';
+  showBriefing('Back on your feet', 'Mara is patched up and back in the city. The jobs are still waiting.');
+  saveGame();
+}
+
+function quitToTitle() {
+  saveGame();
+  saveAvailable = hasSave();
+  G.screen = 'title';
+}
+
+// THE interaction dispatcher: one E keypress, one action, in priority
+// order — mission trigger, then shop, then enter/exit car. Nothing else
+// in the game reads the interact key.
+function handleInteract() {
+  if (missionInteract()) return;
+  if (shopInteract()) return;
+  const p = G.player;
+  if (p.inCar) { exitCar(); return; }
+  const car = nearestCar(p.x, p.y, 60);
+  if (car) enterCar(car);
+}
+
+function handleMenuAction(action) {
+  if (!action) return;
+  sfxClick();
+  if (action === 'new') { clearSave(); startNewGame(); }
+  else if (action === 'continue') continueGame();
+  else if (action === 'help') { G.prevScreen = G.screen; G.screen = 'help'; }
+  else if (action === 'back') { G.screen = G.prevScreen === 'help' ? 'title' : G.prevScreen; }
+  else if (action === 'resume') G.screen = 'play';
+  else if (action === 'save') { saveGame(); G.message = { text: 'Game saved!', until: G.time + 2 }; G.screen = 'play'; }
+  else if (action === 'quit') quitToTitle();
+  else if (action === 'respawn') respawn();
+}
+
+function updatePlay(dt) {
+  const p = G.player;
+  // Aim follows the mouse.
+  p.aimAngle = aimAngleFromMouse(G.camera, canvas.width, canvas.height);
+
+  if (pressed.interact) handleInteract();
+  if (pressed.slot1) switchWeapon(0);
+  if (pressed.slot2) switchWeapon(1);
+  if (pressed.slot3) switchWeapon(2);
+  if (pressed.reload) startReload();
+  if (pressed.horn && p.inCar) sfxHorn();
+
+  // Shooting: hold for automatic weapons, click for the rest.
+  if (!p.inCar) {
+    const auto = p.weapon === 'smg';
+    if (auto ? mouse.down : mouse.clicked) playerShoot();
+  }
+
+  if (!p.inCar) updatePlayerOnFoot(dt);
+  else {
+    if (p.fireCooldown > 0) p.fireCooldown -= dt;
+    if (p.invuln > 0) p.invuln -= dt;
+  }
+  updateVehicles(dt);
+  updatePeds(dt);
+  updatePolice(dt);
+  updateBullets(dt);
+  updateEnemies(dt);
+  updateMissions(dt);
+  updateEffects(dt);
+  updateCamera(canvas.width, canvas.height);
+
+  // Engine sound follows the ride.
+  setEngine(!!p.inCar, p.inCar ? Math.min(1, Math.abs(p.inCar.speed) / p.inCar.def.maxSpeed) : 0);
+
+  // Autosave on a slow timer.
+  G.autosaveTimer += dt;
+  if (G.autosaveTimer > 30) {
+    G.autosaveTimer = 0;
+    saveGame();
   }
 }
 
-function saveBest(value) {
-  try {
-    window.localStorage.setItem(BEST_KEY, String(value));
-  } catch {
-    // Storage can be off (private windows): the best score then lasts this visit only.
-  }
-}
-
-function runShot(name) {
-  const scene = stageShot(name, world);
-  let painted = 0;
-  function paint() {
-    renderer.draw(world.state, scene.screen, scene.best);
-    painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
-  }
-  requestAnimationFrame(paint);
-}
-
-function runGame() {
-  const input = createInput(canvas);
-  let screen = SCREEN_TITLE;
-  let best = readBest();
-  let accumulator = 0;
-  let last = performance.now();
-
-  // Screen readers (and anyone watching the page's text) hear the screen changes and each hit.
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function startGame() {
-    world.reset();
-    accumulator = 0;
-    screen = SCREEN_PLAY;
-    announce(`Playing. ${LIVES} lives.`);
-  }
-
-  function endGame() {
-    screen = SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      saveBest(best);
-    }
-    announce(`Game over. Score ${world.state.score}. Best ${best}.`);
-  }
-
-  function handleActions() {
-    const actions = input.takeActions();
-    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER)) startGame();
-    else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
-
-  function step() {
-    if (screen === SCREEN_TITLE) {
-      world.step(STEP, 0, true);
-      return;
-    }
-    const events = world.step(STEP, input.direction(), false);
-    if (events & EVENT_OVER) endGame();
-    else if (events & EVENT_HIT) announce(world.state.lives === 1 ? 'Hit. 1 life left.' : `Hit. ${world.state.lives} lives left.`);
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
-        accumulator -= STEP;
-      }
-    } else {
-      accumulator = 0;
-    }
-    renderer.draw(world.state, screen, best);
-  }
-
-  // Leaving the tab pauses a running game rather than letting blocks fall unseen.
-  document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
-      announce('Paused.');
-    }
-  });
-
-  announce('Block Dodger. Press Space or click to start.');
+function frame(now) {
   requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - lastNow) / 1000 || 0.016);
+  lastNow = now;
+  G.time += dt;
+
+  // Global keys.
+  if (pressed.mute) {
+    setMuted(!isMuted());
+    G.muted = isMuted();
+  }
+  if (pressed.pause) {
+    if (G.screen === 'play') { G.screen = 'pause'; saveGame(); }
+    else if (G.screen === 'pause') G.screen = 'play';
+    else if (G.screen === 'help') G.screen = G.prevScreen;
+  }
+
+  // First gesture unlocks audio.
+  if (mouse.clicked || pressed.interact) initAudio();
+
+  if (G.screen === 'play') {
+    updatePlay(dt);
+    // A wasted/busted switch mid-update still draws the world behind it.
+    drawWorld(ctx, canvas.width, canvas.height);
+    drawHUD(ctx, canvas.width, canvas.height);
+    drawStoryCompleteBanner(ctx, canvas.width);
+    if (G.screen === 'wasted') drawWasted(ctx, canvas.width, canvas.height);
+    else if (G.screen === 'busted') drawBusted(ctx, canvas.width, canvas.height);
+    else if (G.screen === 'pause') drawPause(ctx, canvas.width, canvas.height);
+  } else if (G.screen === 'pause') {
+    drawWorld(ctx, canvas.width, canvas.height);
+    drawHUD(ctx, canvas.width, canvas.height);
+    drawPause(ctx, canvas.width, canvas.height);
+  } else if (G.screen === 'title') {
+    drawTitle(ctx, canvas.width, canvas.height, saveAvailable);
+  } else if (G.screen === 'help') {
+    drawHelp(ctx, canvas.width, canvas.height);
+  } else if (G.screen === 'wasted') {
+    drawWorld(ctx, canvas.width, canvas.height);
+    drawWasted(ctx, canvas.width, canvas.height);
+  } else if (G.screen === 'busted') {
+    drawWorld(ctx, canvas.width, canvas.height);
+    drawBusted(ctx, canvas.width, canvas.height);
+  }
+
+  // Menu clicks.
+  if (mouse.clicked && G.screen !== 'play') {
+    handleMenuAction(clickMenu(mouse.x, mouse.y));
+  }
+  endFrameInput();
 }
 
-if (shot) runShot(shot);
-else runGame();
+let lastNow = performance.now();
+
+// Boot: a ?shot= scene stages itself; otherwise show the title.
+(function boot() {
+  const { shot, seed } = shotParams();
+  if (shot && shot !== 'start') {
+    G.shotMode = shot;
+    stageShot(shot, seed);
+    beginAudio();
+  } else {
+    // Build a quiet world behind the title screen so it never sits empty.
+    newWorld(1);
+    const a = G.world.anchors;
+    G.player = freshPlayer(a.start.x, a.start.y);
+    G.camera.x = G.player.x - canvas.width / 2;
+    G.camera.y = G.player.y - canvas.height / 2;
+  }
+  requestAnimationFrame(frame);
+})();
+
+// Expose a tiny debug handle for automated playtests.
+window.__sunfall = { G, startNewGame, continueGame, handleInteract, playerShoot };
